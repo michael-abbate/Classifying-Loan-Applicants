@@ -1,0 +1,646 @@
+---
+title: "Classifying Loan Applicants"
+author: "Michael Abbate"
+output:
+  github_document:
+    toc: yes
+    toc_depth: 2
+
+---
+
+```{r global-setup, echo = FALSE, include = FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(pander)
+library(ROCR)
+```
+
+```{r echo=FALSE, include=TRUE}
+discrete = function(var){
+  tbl <- rbind(tapply(credit$BAD, var, sum),
+               tapply(1-credit$BAD, var, sum),
+               tapply(credit$BAD, var, mean))
+  dimnames(tbl)[[1]] <- c("BAD", "GOOD", "%BAD")
+  return(round(tbl,4))
+  }
+```
+
+```{r odds-fct, echo=FALSE, include=TRUE}
+odds = function(x,y) {
+  prob = tapply(y, x, mean)
+  ans = (prob)/(1-prob)
+  return(ans)
+  }
+```
+
+```{r plot-means, echo=FALSE, include=TRUE}
+plotVar = function(orig_data, var, label){
+  cb = ggplot(orig_data) +
+  aes(x = var, y = BAD) +
+  geom_jitter(height = .02, shape = 1) +
+  labs(x = label, y = 'Good/Bad Credit')
+  
+  quantiles = unique(quantile(var, probs = seq(0, 1, length = 11)))
+  
+  new_var = cut(var, breaks = quantiles)
+  
+  pts = tapply(credit$BAD, new_var, mean)
+  xs = (quantiles[-1] + quantiles[-length(quantiles)])/2
+  cb = cb + geom_point(data = data.frame(x = xs, y = pts), mapping = aes(x=x, y=y), color='red')
+  cb = cb + geom_vline(xintercept = quantiles, color = "grey")
+  
+  cb = cb + geom_smooth(se=FALSE) 
+  return(cb)
+  }
+```
+
+```{r cm-metrics-definition, echo=FALSE, include=TRUE}
+cm.metrics <- function(cm) {
+  acc <- sum(diag(cm))/sum(cm)
+  pre <- cm[1,1]/sum(cm[1,])
+  sen <- cm[1,1]/sum(cm[,1])
+  spe <- cm[2,2]/sum(cm[,2])
+  
+  ans <- c("Accuracy" = acc,
+           "Precision" = pre,
+           "Sensitivity" = sen,
+           "Specificity" = spe)
+  return(ans)
+}
+```
+
+```{r resid-fct, echo=FALSE, include=TRUE}
+resid.plot = function(model){
+  p <- predict(model, type = "response")
+  r <- resid(model, type = "deviance")
+  r.plot = ggplot(data = data.frame(x = p, y = r)) +
+    aes(x = x, y = y) +
+    geom_jitter(height = 0.02, width = 0.02) +
+    geom_smooth() +
+    labs(x = "Predicted Probabilities", y = "Deviance Residuals")
+  return(print(r.plot))
+}
+```
+
+
+```{r hosmer-lemeshow-goodness-of-fit-test, echo=FALSE, include=TRUE}
+HL <- function(a, e, g = 10) {
+  y <- a
+  yhat <- e
+  qq <- quantile(yhat, probs = seq(0, 1, 1/g))
+  cutyhat <- cut(yhat, breaks = qq, include.lowest = TRUE)
+  observed <- xtabs(cbind(y0 = 1 - y, y1 = y) ~ cutyhat)
+  expected <- xtabs(cbind(yhat0 = 1 - yhat, yhat1 = yhat) ~ cutyhat)
+  C.hat <- sum((observed - expected)^2/expected)
+  p.val <- 1 - pchisq(C.hat, g - 2)
+  ans <- c("HL Stat." = C.hat,
+           "P-Value" = p.val)
+  return(ans)
+}
+```
+
+
+```{r read-file, echo=FALSE, include=TRUE}
+credit = read.table('credit-data-train.txt', header = TRUE)
+```
+
+```{r echo=FALSE, include=TRUE}
+
+# Create an Age variable using DOB. Reference year is 2000
+credit$age = 100 - credit$DOB
+
+# Create adjusted age variable (get rid of all '1s')
+age_avg = (round(mean(credit$age)))
+credit$age.adj = ifelse(credit$age == 1, age_avg, credit$age)
+
+# Household income is applicant inc. + spouse inc.
+credit$hhinc = credit$DAINC + credit$SINC
+
+# Create expenses variable
+credit$expenses = credit$DOUTCC+credit$DOUTHP+credit$DOUTL+credit$DOUTM
+
+# Calculate leftover money
+credit$leftover = pmax(credit$hhinc - (credit$expenses*12),0)
+
+# Group employment statuses
+credit$emp_cat[credit$AES == 'B'|credit$AES == 'E'|credit$AES == 'R'|credit$AES == 'W'|credit$AES == 'U'|credit$AES == 'N'|credit$AES == 'Z'] = 'Group 1'
+credit$emp_cat[credit$AES == 'P'|credit$AES == 'M'|credit$AES == 'T'|credit$AES == 'V'] = 'Group 2'
+credit$emp_cat = factor(credit$emp_cat)
+
+# Total number of dependants
+credit$total.dep = credit$NKID + credit$DEP
+
+```
+
+# 1. Abstract
+
+The ability to predict if someone is a good or bad applicant for a loan is a valuable skill for banks and financial firms. This skill allows these companies to invest their money properly for the future. This study examines a data set of loan applicants that was retrieved from “Credit Scoring and Its Applications” by Lyn C. Thomas, David B. Edelman, and Jonathan N. Crook (2002). Logistic regression models were created to predict probability of default on a loan. From these models, we concluded that age, household income, credit card expense, and employment status were significant factors in predicting these probabilities.
+
+
+# 2. Introduction
+
+We will be looking at a  file, *credit-data-train.txt*, that consists of credit applicants information. It consists of variables relevant to the applicant regarding their spouse, their home, their incomes, expenses, and number of dependants and children. This report will summarize trends of being a good/bad credit applicant and some explanatory variables using logistic regression analysis.
+
+Variables we found to be significant were age, household income, credit card expense, and employment status. In the original data set, we were given date of birth, not age. To calculate age, we used the year 2000 as a reference in relation to date of birth. We used this year because we retrieved the data set from a book that was published in 2002. Also, we found that age has a quadratic relationship with the probability of default. From this, we were able to add and justify the term, $\text{age}^2$, to our model. On the other hand, we found that variables like having a home phone, house value, and total number of dependants did not show significance in prediciting probability of defaulting on a loan.
+
+The remainder of the report is structured as follows. The next section discusses the characteristics of the data we have available and assumptions about their significance in predicting probability of defaulting. In the section "Model Selection & Interpretation," we make a case for two models that fit the data adequately. The report finishes with an alternative approach and a summary of our findings and ideas for further work in this area.
+
+
+
+# 3. Data Characteristics
+
+From the file *credit-data-train.txt*, we have `r prettyNum(nrow(credit))` observations that has 15 variables. 
+
+The following table shows the variables available and their definitions.
+
+| Item | Variable                       | Definition                                                          |
+|:-----|:-------------------------------|:--------------------------------------------------------------------|
+|  1   | Date of Birth                  | The last two digits of the applicant's date of birth.               |
+|  2   | # of Children                  | The number of children the applicant has.                           |
+|  3   | # of Dependants                | The number of dependants the applicant has.                         |
+|  4   | Home Phone                     | Is there a phone in the house?                                      |
+|  5   | Spouse's Income                | The applicant's spouse's income (in dollars).                       |
+|  6   | Employment Status              | Employment status of the applicant.                                 |
+|  7   | Applicant's Income             | The applicant's income (in dollars).                                |
+|  8   | Residential Status             | The residential status of the applicant.                            |
+|  9   | Value of Home                  | The value of the applicant's home.                                  |
+| 10   | Mortgage Balance Outstanding   | How much money is left on the applicant's mortgage (in dollars).    |
+| 11   | Outgoings on Mortgage/Rent     | Money spent monthly on the applicant's mortgage (in dollars).       |
+| 12   | Outgoings on Loans             | Money spent monthly on the applicant's Loans (in dollars).          |
+| 13   | Outgoings on Hire Purchase     | Money spent monthly on the applicant's Hire Purchases (in dollars). |
+| 14   | Outgoings on Credit Cards      | Money spent monthly on the applicant's Credit Cards (in dollars).   |
+| 15   | Good/Bad Indicator             | Are they a good or bad credit applicant?                            |
+
+Before diving into a model, we must first analyze the data to assure there are no outliers that will negatively affect our predictions. Also, going through each variable allows us to make earlier and better predictions about which would be significant in our model or not. 
+
+## Target Variable
+First, let's take a look at the variable we are trying to predict: `BAD`. This variable is an indicator that tells us if the loan applicant is "bad" (1) or "good" (0). The following table shows the total number of applicants, the total number of "bad" applicants, and the average indicator percentage.
+
+BAD Summary:
+```{r BAD-summary, echo=FALSE, include=TRUE}
+df = data.frame('Total Number of Applicants' = dim(credit)[1], 'Number of Bad Applicants' = sum(credit$BAD), 
+                'Avg BAD Pct'  = round(mean(credit$BAD),4))
+pander(df)
+```
+The information above shows us that about `r round(mean(credit$BAD),2)*100`% of the applicants in the data set are considered "bad." A null logistic regression model in the appendix (A1) shows the same result as the average calculation above.
+
+
+## Categorical Variables
+
+Resident Status (`RES`):
+```{r RES-status, echo=FALSE, include=TRUE}
+# Mean according to residential status
+res.df = data.frame(discrete(credit$RES))
+names(res.df) = c('Tenant Furnished', 'Other', 'Owner', 'With Parents', 'Tenant Unfurnished')
+res.df
+```
+
+In this case, because these averages are rather similar to the overall average, `r round(mean(credit$BAD),2)*100`%, we will most likely not be including residential status to distinguish who is a good/bad credit applicant.
+
+
+Employment Status (`AES`):
+
+```{r AES-status, echo=FALSE, include=TRUE}
+aes.df = data.frame(discrete(credit$AES))
+names(aes.df) = c('Public Sector', 'Self Employed', 'Military', 'Others', 'Private Sector', 'Retired','Student', 'Unemployed', 'Government', 'Housewife', 'No Response')
+aes.df
+```
+
+Looking at the table above, the probability of defaulting for each employment status tends to vary; however, working with 11 categories within a variable may be too much for a model to be efficient and/or effective. Thus, we will most likely group similar employment statuses to condense the variable and use these groupings in our model.  
+
+
+Phone in the house (`PHON`):
+
+```{r Phone-status, echo=FALSE, include=TRUE}
+phon.df = data.frame(discrete(credit$PHON))
+names(phon.df) = c('No Phone', 'Phone')
+phon.df
+```
+
+Having no phone in the house is above the overall BAD indicator average, `r round(mean(credit$BAD),4)*100`%, in terms of risk. However, because about 90% of applicants do have a phone in the house, we will most likely not be including this variable in our model.
+
+Below we will look at the number of children and dependants for each applicant: 
+
+Number of children (`NKID`):
+```{r num-children-status, echo=FALSE, include=TRUE}
+discrete(credit$NKID)
+```
+
+Number of dependants (`DEP`):
+```{r dependants-status, echo=FALSE, include=TRUE}
+discrete(credit$DEP)
+```
+The majority of applicants have 0 children and 0 dependants and the majority of applicants' probability of defaulting is around the original average, `r round(mean(credit$BAD),4)`. Therefore, because these variables are similar and the averages are close to the original average, we will most likely not be including number of kids or dependants in our model. 
+ 
+## Continuous Variables
+This section will look at the continuous variables in our data set. 
+
+The following graph shows the distribution of home value, `DHVAL`, and the `BAD` indicator:
+
+```{r echo=FALSE, include=TRUE}
+plotVar(credit, credit$DHVA, 'Home Value') + ggtitle('Home Value vs. BAD Indicator') 
+```
+
+The following graph shows the distribution of mortgage balance, `DMORT`, and the `BAD` indicator:
+
+```{r echo=FALSE, include=TRUE}
+plotVar(credit, credit$DMORT, 'Mortgage Balance') + ggtitle('Mortgage Balance vs. BAD Indicator')
+```
+
+A value of '0' for these variables means there were no responses for home value or mortgage balance. However, looking at all values greater than 0 for both home values and mortgage balance, we do not see a significant difference in BAD averages. Thus, we will most likely not be including home value and mortgage balance in our model. 
+
+
+After looking at the distributions for applicant income and spouse income, we concluded they have a similar pattern of probability of default. As a result, we decided to combine these two variables into household income, `hhinc`.
+
+Household Income distribution:
+
+```{r Household-Income, echo=FALSE, include=TRUE}
+plotVar(credit,credit$hhinc, 'Household Income') + ggtitle('Household Income vs. BAD Indicator')
+```
+
+From the graph above, we concluded there is a significant trend in probability of default from Household Income. The trend is downwards meaning as household income increases, the likelihood of being a "bad" loan applicant decreases. 
+
+
+There are four variables that deal with the applicants' expenses: mortgage expense (`DOUTM`), loan expense (`DOUTL`), hire purchase expense (`DOUTHP`), and credit card expense (`DOUTCC`). The averages from the four expenses in the data set range from \$`r round(mean(credit$DOUTHP),2)` to \$`r round(mean(credit$DOUTM),2)`. Therefore, these expenses are provided monthly rather than annually, like the income variables. Using both household income and the expenses, we created a variable that calculates the amount of money leftover after paying off all monthly expenses. This variable, `leftover`, is equal to $\text{Household Income - 12*Expenses}$. We found this variable to be insignificant in prediciting probability of default. Its distribution is shown in appendix (A2). 
+
+
+In this data set, we were given `DOB`, which provides the last two digits of the year the applicant was born. From this variable, we calculated age by subtracting the `DOB` from 100. This gives us the applicants age in reference to the year 2000. The following information summarizes `age`:
+```{r Age, echo=FALSE, include=TRUE}
+summary(credit$age)
+```
+
+Note that having the age of 1 means that age was unknown for these candidates. Including these values slightly skews the data because the age summary above shows that most values are above the age of 30 and there are only `r length(which(credit$age == 1))` values with age of 1. To assure the data has no outliers, we will use the average age value for these applicants instead. The calculation of this average will exclude those who did not submit an age. We are comfortable doing this because, as mentioned before, there are only `r length(which(credit$age == 1))` observations in which age was not submitted. If a larger percentage of applicants did not submit their age, a more accurate approach would have been used to assure the age variable was precise and not skewed. This adjusted age variable will be called, `age.adj`. 
+
+
+```{r, echo=FALSE, include=TRUE}
+summary(credit$age.adj)
+```
+
+The following graph shows the distribution of `age.adj` and the `BAD` indicator:
+
+```{r, echo=FALSE, include=TRUE}
+plotVar(credit, credit$age.adj, 'Adjusted Age') + ggtitle('Adjusted Age vs. BAD Indicator')
+```
+
+The trend from the graph above shows that as age increases, applicants are more likely to be "bad" credit applicants. Due to this increase, we will most likely include this variable in our model.
+
+
+
+# 4. Model Selection and Interpretation
+
+The data characteristics section gave us insights on which variables will most likely be significant in predicting a "bad" or "good" loan applicant. This section will summarize these variables together in the attempt to predict `BAD` indicator. After stating the model and giving its interpretations, we will look at the data driven steps taken to select the recommended model. These steps include looking at cross-validation, the Hosmer-Lemeshow statistic, and metrics of the models. 
+
+ 
+### The Recommended Model
+After going through all of the variables and gaining insights and assumptions from our data characteristics section, we now have enough information to narrow our selection down to two models: `m01` and `m02`. In the end, we ended up selecting Model 1, `m01`, as our recommended model for numerous reasons that we will touch upon later in this section.
+
+```{r final-models, echo=TRUE, include=TRUE}
+m01 = glm(BAD ~ age.adj + I(age.adj^2) + DOUTCC + hhinc + emp_cat, data = credit, family = binomial(link = 'logit'))
+
+m02 = glm(BAD ~ age.adj + I(age.adj^2) + DOUTCC + hhinc, data = credit, family = binomial(link = 'logit'))
+```
+
+```{r display, echo=FALSE, INCLUDE=TRUE}
+pander(m01, caption = 'Model 1' , type='rmarkdown')
+pander(m02, caption = 'Model 2' , type='rmarkdown')
+```
+
+The groups within the categorical employment status variable are as follows:
+
+| Group | Employment Status                                                                 |
+|:------|:----------------------------------------------------------------------------------|
+|  1    | Public Sector, Self Employed, Retired, Housewife, Unemployed, Other, No Response  | 
+|  2    | Private Sector, Military, Student, Government                                     |
+
+### Interpretation of the Model
+
+Our model includes components of age, credit card expense, income, and employment status. To better understand our recommended model, let’s set up an example to test it out. First, we will use all median values for continuous variables and Group 1 of our categorical employment status variable. Consider a 46-year old applicant that is retired. He and his spouse combined make \$21,000 per year, and he pays a credit card expense of \$40 per month. Our equation will look like this:
+
+$$
+\pi = \frac{\text{e}^{(-0.7294+0.01004(46)+(5.076*10^-5)(46^2)-0.003203(480)-(2.639*10^-5)(21000)-0.4411(0))}}
+{1 + \text{e}^{(-0.7294+0.01004(46)+(5.076*10^-5)(46^2)-0.003203(200)-(2.639*10^-5)(21000)-0.4411(0))}}
+$$
+```{r echo=FALSE, include=TRUE}
+prob1 = exp(-0.7294+0.01004*(46)+(5.076*10^-5)*(46^2)-0.003203*(480)-(2.639*10^-5)*(21000)-0.4411*(0))/(1+exp(-0.7294+0.01004*(46)+(5.076*10^-5)*(46^2)-0.003203*(200)-(2.639*10^-5)*(21000)-0.4411*(0)))
+```
+From the equation above, we conclude that the typical applicant has a `r round(prob1, 4)*100`% probability of being a "bad" applicant.
+
+Now let's consider he is 47 years old and he works for the government:
+$$
+\pi' = \frac{\text{e}^{(-0.7294+0.01004(47)+(5.076*10^-5)(47^2)-0.003203(480)-(2.639*10^-5)(21000)-0.4411(1))}}
+{1 + \text{e}^{(-0.7294+0.01004(47)+(5.076*10^-5)(47^2)-0.003203(200)-(2.639*10^-5)(21000)-0.4411(1))}}
+$$
+
+```{r echo=FALSE, include=TRUE}
+prob2 = exp(-0.7294+0.01004*(47)+(5.076*10^-5)*(47^2)-0.003203*(480)-(2.639*10^-5)*(21000)-0.4411*(1))/(1+exp(-0.7294+0.01004*(47)+(5.076*10^-5)*(47^2)-0.003203*(200)-(2.639*10^-5)*(21000)-0.4411*(1)))
+```
+
+From the new equation, we obtain a probability of default to be `r round(prob2, 4)*100`%.
+
+Therefore, a 1 year increase in age and changing from being retired to a government worker (Group 1 to Group 2) decreases probability of default by `r (round(prob1, 4) - round(prob2, 4))*100`%.
+
+### Justification of the Model
+
+The only difference between the two models is the categorical employment status variable. Below we take a look at the progression of our model and the adjustments taken to obtain our final model.
+
+#### Residuals
+
+The residual plot for `age.adj` is presented below:
+```{r echo=FALSE, include=TRUE}
+mod1 = glm(BAD ~ age.adj, data = credit, family = binomial(link = 'logit'))
+resid.plot(mod1)
+```
+
+The blue line in the graph above shows the relationship between predicted probabilities and deviance residuals. The relationship looks quadratic; so, in our next model, let's see what adding $age.adj^2$ will do to the residuals.
+
+```{r echo=FALSE, include=TRUE}
+mod2 = glm(BAD ~ age.adj + I(age.adj^2), data = credit, family = binomial(link = 'logit'))
+resid.plot(mod2)
+```
+
+The blue line above is now showing there is less pattern in this residual plot than the previous one. Thus, including $\text{adj.age}^2$ reduces the overall values of residuals. From this plot however, there is a spike of values around .23, which most likely means other variables need to be taken into account to reduce error in this area. In that case, let's see what adding credit card expense and household income does to the residuals.
+
+```{r echo=FALSE, include=TRUE}
+mod3 = glm(BAD ~ age.adj + I(age.adj^2) + DOUTCC + hhinc, data = credit, family = binomial(link = 'logit'))
+resid.plot(mod3)
+```
+
+Adding Houshold Income and Credit Card expense reduce the pattern in the residual plot. Therefore, adding these variables to our model helped reduce the errors. However, the graph now has an unexpected increase in residuals towards the end of the plot. Below shows the residual plot of the next and final variation of the recommended model which includes the following variables: age, $\text{age}^2$, credit card expense, household income, and employment status.
+
+```{r echo=FALSE, include=TRUE}
+mod5 = glm(BAD ~ age.adj + I(age.adj^2) + DOUTCC + hhinc + emp_cat, data = credit, family = binomial(link = 'logit'))
+resid.plot(mod5)
+```
+
+Adding the employment status categorical variable to our model reduced the errors. In the appendix (A4), we show the progression of our model and how adding other variables only decreased its significance in predicting probability of default. 
+
+#### Metrics for Recommended Model `m01`:
+
+First, to test our model, we will take a look at its metrics. It is crucial to pick a proper threshold to assure we are predicting `BAD` indicator to the best of our ability. In selecting a threshold, we will direct most of our attention towards sensitivity. We do this because having a higher sensitivity means we are being more cautious of accepting "bad" people. Accepting more "bad" people (sensitivity) would be more costly than declining "good" people (specificity) because banks lose more money offering loans to those who cannot pay them back. In conclusion, from a cost efficient perspective, banks would rather reject "good" applicants than accept "bad" applicants.
+
+Below we calculate the metrics for our recommended model `m01` using multiple thresholds:
+
+```{r echo=FALSE, include=TRUE}
+p <- predict(m01, type = "response") # predicted probabilities
+TC <- credit$BAD # true condition
+
+thresholds <- seq(0.1, 0.6, by = 0.1)
+M <- matrix(NA, nrow = length(thresholds), ncol = 5)
+i <- 1
+for(thr in thresholds){
+  PC <- ifelse(p > thr, 1, 0) # predicted condition 1 = yes BAD, 0 = no
+  # Confusion Matrix
+  cm <- table(factor(PC, levels = c("1", "0")),
+              factor(TC, levels = c("1", "0")))
+  dimnames(cm) <- list(c("pc.POS", "pc.NEG"),
+                       c("tc.POS", "tc.NEG"))
+  M[i,] <- c(thr, cm.metrics(cm))
+  i <- i+1
+}
+dimnames(M)[[2]] <- c("Threshold", "Accuracy", "Precision", "Sensitivity", "Specificity")
+M <- as_tibble(M)
+M
+```
+
+The Receiver Operating Characteristic Curve, given below, shows where the most beneficial threshold would be for predicting `BAD` indicator. In this case, maximizing true positive rate and minimizing false positive rate are our priorities as we want to classify as many `BAD` cases as possible with little error. Therefore, we will be focusing on Sensitivity, or the percent of actual `BAD` records correctly classified as `BAD`.
+
+```{r echo=FALSE, include=TRUE}
+pred <- prediction(p, credit$BAD)
+perf <- performance(pred,"tpr","fpr")
+plot(perf,col="black")
+abline(a=0, b=1)
+auc =  performance(pred,  c("auc"))
+auc = unlist(slot(auc , "y.values"))
+```
+
+Using the table and graph above, we selected 0.35 as the threshold. This threshold maximizes sensitivity and accuracy. Also, from the ROC Curve, we receive an area under the curve (AUC) of `r round(auc,2)`. This means there is a `r round(auc,2)*100`% chance that the model will be able to distinguish between a "bad" and "good" applicant.
+
+Below shows the confusion matrix and metrics for our recommended model using the selected threshold, 0.35. 
+
+```{r matrix, echo=FALSE, include=TRUE}
+p1 = predict(m01, newdata = credit, type='response')
+pc1 = ifelse(p1>.35, 1,0)
+tc1 = credit$BAD
+matrix = table(factor(pc1, levels = c(1,0)),
+      factor(tc1, levels = c(1,0)))
+dimnames(matrix) = list(c('Predicted Bad', 'Predicted Good'), c('Actually Bad', 'Actually Good'))
+matrix
+```
+
+
+```{r echo=FALSE, include=TRUE}
+M <- matrix(NA, nrow = 1, ncol = 4)
+l <- list(m01)
+i <- 1
+for(f in l){
+  p <- predict(f, type = "response")
+  PC <- ifelse(p > 0.35, 1, 0)
+  TC <- credit$BAD
+  cm <- table(factor(PC, levels = 1:0),
+              factor(TC, levels = 1:0))
+  M[i,] <- cm.metrics(cm)
+  i <- i + 1
+}
+dimnames(M) <- list(paste("m0", 1, sep = ""),
+                    c("Accuracy", "Precision", "Sensitivity", "Specificity"))
+round(M * 100, 2)
+```
+
+
+
+
+#### Cross-Validation for the Model
+
+Cross-validation is the act of applying different sets of data to a model to see if it is still able to make proper predictions.  
+
+```{r cross-validation-split-in-10-parts, echo=FALSE, include=TRUE}
+set.seed(111)
+credit$fold <- sample(c(rep(0, 90), rep(1, 90), rep(2, 90),
+                      rep(3, 90), rep(4, 90), rep(5, 90),
+                      rep(6, 90), rep(7, 90), rep(8, 90), rep(9, 90)),
+                    nrow(credit),
+                    replace = FALSE)
+```
+
+Below we implement the cross-valiadation algorithm and obtain the following metrics:
+
+```{r k-fold-cross-validation, echo=FALSE, include=TRUE}
+set.seed(111)
+F <- matrix(NA, nrow = 10, ncol = 5) # for storing our metrics for each fold
+dimnames(F)[[2]] <- c("fold", "accuracy", "precision", "sensitivity", "specificity")
+i <- 1
+for(fld in 0:9){
+  fit <- glm(BAD ~ age.adj + I(age.adj^2) + DOUTCC + hhinc + emp_cat,
+             data = credit,
+             subset = fold != fld, 
+             family = binomial(link = "logit"))
+  
+  p <- predict(fit,
+               newdata = subset(credit, subset = fold == fld),
+               type = "response")
+  PC <- ifelse(p > 0.35, 1, 0)
+  TC <- credit$BAD[credit$fold == fld] 
+  cm <- table(factor(PC, levels = 1:0),
+              factor(TC, levels = 1:0))
+  F[i,] <- c(fld, cm.metrics(cm))
+  i <- i + 1
+}
+fld.means <- apply(F, 2, mean)[2:5] # calculate means for each column
+round(fld.means,4)
+```
+
+Next, we compare the cross-validated metrics with the metrics calculated from the whole dataset.
+
+```{r cross-validated-vs-whole-sample, echo=FALSE, include=TRUE}
+whole.sample <- M[1,]
+tbl <- rbind("Whole Sample" = whole.sample,
+      "Cross-Validated" = fld.means,
+      "Difference" = whole.sample - fld.means)
+dimnames(tbl)[[2]] <- c("Accuracy", "Precision", "Sensitivity", "Specificity")
+round(tbl,4)
+```
+
+Computing this cross-validation analysis allows us to see how our model performs with new data it has never seen before. When the model is used with data it was not built on, our metrics drop. Therefore, in presenting our model, we are more confident in sharing the "Cross-Validated" metrics rather than the "Whole Sample" metrics from the table above. Analysts using our model would expect outputs  similar to the "Cross-Validated" metrics for their predictions because they will have a new data set, not the set we built our model on. 
+
+
+#### Hosmer-Lemeshow Test
+
+The Hosmer-Lemeshow test calculates if the observed `BAD` indicator rates match the expected `BAD` indicator rates. It is essentially a goodness-of-fit test. 
+
+Below shows the Hosmer-Lemeshow statistics for the two models:
+
+```{r echo=FALSE, include=TRUE}
+rbind("m01" = HL(credit$BAD, predict(m01, type = "response")),
+      "m02" = HL(credit$BAD, predict(m02, type = "response")))
+```
+The HL statistic for `m01` is smaller than that of `m02` showing that there is more evidence that `m01` has a better fit than `m02`. In the appendix (A3), the two models above were compared to others using metrics and the Hosmer-Lemeshow test. 
+
+
+# 5. Summary and Concluding Remarks
+
+The recommended model we selected concludes that the probability of defaulting on a loan can be predicted depending on certain characteristics about the applicant: their age, household income, credit card expense and their employment status. These variables were manipulated (bucketed, grouped, squared, etc.) to reduce the number of errors when attempting to predict the probability of default. There were `r prettyNum(nrow(credit))` observations in the simulated data set, which is relatively low. It is possible that if we were able to obtain more observations and include other variables, we could've built a more accurate model to predict the `BAD` indicator. A variable that may have supported our model's accuracy is their geographical region. Knowing this information may make our model more accurate because certain areas in the country are known for being wealthier than others. 
+
+When it comes to predicting accuracy of our recommended model, we have created a function in the appendix, $\text{score(newdata)}$. The argument, *newdata*, is a data set with the same variables as the intitial data set, *credit-data-train.txt*. In the function, the variables are manipulated as needed to fit into the recommended model, and predicted values are produced based off of the new data passed through the function.
+
+
+# 6. References
+
+Crook, Jonathan N., Edelman, David B., Thomas, Lyn C., **Credit Scoring and Its Applications,** 2002, SIAM.
+
+
+# 7. Appendix
+
+### A1. Null Model
+
+Below is the *null* model. Computing the probability of BAD using this model gives us the original average as stated in our Data Characteristics section. 
+
+```{r null-model}
+f0 = glm(BAD ~ 1, data = credit, family = binomial(link = 'logit'))
+f0
+round(exp(-1.012)/(1+exp(-1.012)),4)
+```
+
+
+### A2. Leftover
+
+The following graph displays the distribution of `leftover` in regards to `BAD` indicator. 
+
+```{r leftover, echo=FALSE, include=TRUE}
+plotVar(credit, credit$leftover, 'Leftover Money') + ggtitle('Leftover vs. BAD Indicator')
+```
+
+
+### A3. Progression of the Recommended Model
+
+Addition of Variables:
+
+```{r model-development}
+# f04 and f03 are m01 and m02 respectively
+f00 = glm(BAD ~ age.adj, data = credit, family = binomial(link = 'logit'))
+
+f01 = glm(BAD ~ age.adj + I(age.adj^2), data = credit, family = binomial(link = 'logit'))
+
+f02 = glm(BAD ~ age.adj + I(age.adj^2) + DOUTCC, data = credit, family = binomial(link = 'logit'))
+
+f03 = glm(BAD ~ age.adj + I(age.adj^2) + DOUTCC + hhinc , data = credit, family = binomial(link = 'logit'))
+
+f04 = glm(BAD ~ age.adj + I(age.adj^2) + DOUTCC + hhinc + emp_cat, data = credit, family = binomial(link = 'logit'))
+
+f05 = glm(BAD ~ age.adj + I(age.adj^2) + DOUTCC + hhinc + emp_cat + total.dep, data = credit, family = binomial(link = 'logit'))
+
+f06 = glm(BAD ~ age.adj + I(age.adj^2) + DOUTCC + hhinc + emp_cat + total.dep + DOUTM, data = credit, family = binomial(link = 'logit'))
+```
+
+
+Progression of Metrics:
+
+```{r echo=FALSE, include=TRUE}
+M2 <- matrix(NA, nrow = 6, ncol = 4)
+l2 <- list(f01, f02, f03, f04, f05, f06)
+i2 <- 1
+for(f in l2){
+  p2 <- predict(f, type = "response")
+  PC2 <- ifelse(p2 > 0.35, 1, 0)
+  TC2 <- credit$BAD
+  cm2 <- table(factor(PC2, levels = 1:0),
+              factor(TC2, levels = 1:0))
+  M2[i2,] <- cm.metrics(cm2)
+  i2 <- i2 + 1
+}
+dimnames(M2) <- list(paste("f0", 1:6, sep = ""),
+                    c("Accuracy", "Precision", "Sensitivity", "Specificity"))
+round(M2 * 100, 2)
+```
+
+Progression of HL Statistics:
+
+```{r HL-development, echo=FALSE, include=TRUE}
+rbind("f01" = HL(credit$BAD, predict(f01, type = "response")),
+      "f02" = HL(credit$BAD, predict(f02, type = "response")),
+      "f03" = HL(credit$BAD, predict(f03, type = "response")),
+      "f04" = HL(credit$BAD, predict(f04, type = "response")),
+      "f05" = HL(credit$BAD, predict(f05, type = "response")),
+      "f06" = HL(credit$BAD, predict(f06, type = "response")))
+```
+
+Looking at the metrics and HL statistics helped narrow our selection of models down to f04 and f03, which are m01 and m02 respectively. Also, note that adding variables such as mortgage expense (`DOUTM`) and total dependants (`total.dep`) decreased model significance. 
+
+### A4. The Score Funcion
+
+The score function was created to test our model using a different data set.
+
+Score function:
+
+```{r score-fct, echo=TRUE, include = TRUE}
+score = function(newdata) {
+  credit = newdata
+
+  credit$age = 100 - credit$DOB
+  age_avg = (round(mean(credit$age)))
+  credit$age.adj = ifelse(credit$age == 1, age_avg, credit$age)
+
+  credit$hhinc = credit$DAINC + credit$SINC
+  
+  credit$emp_cat[credit$AES == 'B'|credit$AES == 'E'|credit$AES == 'R'|credit$AES == 'W'|credit$AES == 'U'|credit$AES == 'N'|credit$AES == 'Z'] =    'Group 1'
+  credit$emp_cat[credit$AES == 'P'|credit$AES == 'M'|credit$AES == 'T'|credit$AES == 'V'] = 'Group 2'
+  credit$emp_cat = factor(credit$emp_cat)
+  
+  # predict mean prob of default for new data
+  p = predict(m01, newdata = credit, type = 'response')
+  ans = ifelse(p>.35, 1, 0)
+  return (ans)
+}
+```
+
+Below we test our score function:
+
+```{r score-test, echo=TRUE, include=TRUE}
+s = score(credit)
+s.table = table(s)
+names(s.table) = c('Good', 'Bad')
+s.table
+```
+
+
+
